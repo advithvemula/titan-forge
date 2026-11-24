@@ -100,11 +100,22 @@ function limited(req) {
 }
 setInterval(() => { const now = Date.now(); for (const [ip, h] of hits) if (now - h.t > 60000) hits.delete(ip); }, 60000).unref();
 
-function clanView(c) {
-  return {
+// The bank record (who took out how much, and when) is only sent to the
+// leader and treasurers.
+function clanView(c, viewerId) {
+  const v = {
     name: c.name, tag: c.tag, bank: c.bank, war: c.war,
     members: Object.entries(c.members).map(([id, m]) => ({ id, name: m.name, role: m.role, war: m.war })),
   };
+  const viewer = viewerId && c.members[viewerId];
+  if (viewer && (viewer.role === 'leader' || viewer.role === 'treasurer')) {
+    v.log = (c.log || []).slice(-100).reverse();
+    v.taken = Object.entries(c.taken || {}).map(([id, t]) => ({
+      id, name: (c.members[id] && c.members[id].name) || t.name, total: t.total, times: t.times, last: t.last,
+      left: !c.members[id],
+    })).sort((a, b) => b.total - a.total);
+  }
+  return v;
 }
 
 /* ---------------- leaderboards ---------------- */
@@ -142,14 +153,14 @@ app.post('/api/lb', (req, res) => {
 
 /* ---------------- clans ---------------- */
 app.get('/api/clans', (req, res) => {
-  const top = Object.values(db.clans).sort((a, b) => b.war - a.war).slice(0, 30).map(clanView);
+  const top = Object.values(db.clans).sort((a, b) => b.war - a.war).slice(0, 30).map((c) => clanView(c));
   res.json(top);
 });
 
 app.get('/api/clan/:name', (req, res) => {
   const c = db.clans[key(req.params.name)];
   if (!c) return fail(res, 404, 'Clan not found');
-  res.json(clanView(c));
+  res.json(clanView(c, String(req.query.id || '')));
 });
 
 app.post('/api/clan/create', (req, res) => {
@@ -169,7 +180,7 @@ app.post('/api/clan/create', (req, res) => {
   };
   db.members[id] = key(name);
   saveSoon();
-  res.json(clanView(db.clans[key(name)]));
+  res.json(clanView(db.clans[key(name)], id));
 });
 
 app.post('/api/clan/join', (req, res) => {
@@ -185,7 +196,7 @@ app.post('/api/clan/join', (req, res) => {
   }
   db.members[id] = key(c.name);
   saveSoon();
-  res.json(clanView(c));
+  res.json(clanView(c, id));
 });
 
 app.post('/api/clan/leave', (req, res) => {
@@ -214,8 +225,59 @@ app.post('/api/clan/donate', (req, res) => {
   if (!c || !c.members[id]) return fail(res, 400, 'You are not in a clan');
   if (!Number.isFinite(amount) || amount <= 0 || amount > 1e9) return fail(res, 400, 'Bad amount');
   c.bank += amount;
+  addLog(c, 'donate', c.members[id].name, amount);
   saveSoon();
-  res.json(clanView(c));
+  res.json(clanView(c, id));
+});
+
+// Bank history shown on the clan page (who put in / took out how much).
+function addLog(c, kind, who, amount) {
+  c.log = c.log || [];
+  c.log.push({ kind, who, amount, at: Date.now() });
+  if (c.log.length > 300) c.log.splice(0, c.log.length - 300);
+}
+
+// Leader appoints or removes a Treasurer (a trustee of the clan bank).
+app.post('/api/clan/role', (req, res) => {
+  if (limited(req)) return fail(res, 429, 'Too many requests, slow down');
+  const { id, target } = req.body || {};
+  const role = req.body && req.body.role;
+  if (!validId(id) || !validId(target)) return fail(res, 400, 'Bad pilot id');
+  const c = db.clans[db.members[id]];
+  if (!c || !c.members[id]) return fail(res, 400, 'You are not in a clan');
+  if (c.members[id].role !== 'leader') return fail(res, 403, 'Only the clan leader can choose treasurers');
+  const t = c.members[target];
+  if (!t) return fail(res, 404, 'That pilot is not in your clan');
+  if (t.role === 'leader') return fail(res, 400, 'The leader already controls the bank');
+  if (role !== 'treasurer' && role !== 'member') return fail(res, 400, 'Bad role');
+  if (role === 'treasurer' && t.role !== 'treasurer') {
+    const count = Object.values(c.members).filter((m) => m.role === 'treasurer').length;
+    if (count >= 5) return fail(res, 400, 'A clan can have at most 5 treasurers');
+  }
+  t.role = role;
+  addLog(c, role === 'treasurer' ? 'appoint' : 'remove', t.name, 0);
+  saveSoon();
+  res.json(clanView(c, id));
+});
+
+// Any member can take scrap out of the clan bank into their own bank.
+// Every withdrawal is recorded for the leader and treasurers.
+app.post('/api/clan/withdraw', (req, res) => {
+  if (limited(req)) return fail(res, 429, 'Too many requests, slow down');
+  const { id } = req.body || {};
+  const amount = Math.floor(Number(req.body && req.body.amount));
+  if (!validId(id)) return fail(res, 400, 'Bad pilot id');
+  const c = db.clans[db.members[id]];
+  if (!c || !c.members[id]) return fail(res, 400, 'You are not in a clan');
+  if (!Number.isFinite(amount) || amount <= 0) return fail(res, 400, 'Enter an amount to withdraw');
+  if (amount > c.bank) return fail(res, 400, `The clan bank only has ${c.bank.toLocaleString()} scrap`);
+  c.bank -= amount;
+  addLog(c, 'withdraw', c.members[id].name, amount);
+  c.taken = c.taken || {};
+  const t = c.taken[id] || (c.taken[id] = { name: c.members[id].name, total: 0, times: 0, last: 0 });
+  t.name = c.members[id].name; t.total += amount; t.times += 1; t.last = Date.now();
+  saveSoon();
+  res.json({ amount, clan: clanView(c, id) });
 });
 
 app.post('/api/clan/war', (req, res) => {
