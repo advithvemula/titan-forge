@@ -1,0 +1,17 @@
+{
+  "name": "titan-forge",
+  "version": "1.0.0",
+  "description": "Titan Forge 3D mech game with online co-op, PvP duels, leaderboards and clans",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "peer": "^1.0.2",
+    "pg": "^8.13.0"
+  }
+}
